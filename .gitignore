@@ -1,0 +1,14 @@
+output_data/
+runs/
+dataset/
+*.pyc
+__pycache__/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.json
+*.txt
+*.csv
+*.npy
+*.npz

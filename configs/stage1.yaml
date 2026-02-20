@@ -1,0 +1,140 @@
+# Stage 1 Configuration: Layout Training (70K iterations)
+# Goal: Learn layout from scratch (InstanceAssemble-style training)
+
+# Training Stage
+stage: 1
+stage_name: "layout_training"
+
+# Model Configuration
+model:
+  flux_model_name: "black-forest-labs/FLUX.1-dev"
+  max_refs: 50
+  num_double_blocks: 19
+  num_single_blocks: 38
+  dim: 3072
+  device: "cuda"
+
+# Training Hyperparameters
+training:
+  num_iterations: 70000
+  batch_size: 1  # Reduced from 2 to save memory
+  gradient_accumulation_steps: 8  # Effective batch size = 8 (same as before)
+  learning_rate: 1.0e-4
+  warmup_steps: 1000
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"  # bfloat16 for FLUX
+  gradient_checkpointing: true
+
+# Optimizer
+optimizer:
+  type: "AdamW"
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# Learning Rate Scheduler
+scheduler:
+  type: "cosine"
+  num_warmup_steps: 1000
+  num_training_steps: 70000
+
+# Loss Weights (Stage 1: Flow matching only)
+loss_weights:
+  flow_matching: 1.0
+  dino_identity: 0.0  # Not used in Stage 1
+  region_preservation: 0.0  # Placeholder for future
+
+# Layer Freezing (Stage 1)
+freeze:
+  flux_transformer: true
+  clip_encoder: true
+  dino_encoder: true
+  vae: true
+  modulation_head: true  # Frozen in Stage 1
+  feedback_bridge: true  # Frozen in Stage 1
+
+trainable:
+  alpha_predictor: true
+  instance_fusion_mlp: true
+  layout_head: true
+  assemble_attn_lora: true  # LoRA rank 128 on FLUX attention
+
+# LoRA Configuration
+lora:
+  rank: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules: ["to_q", "to_k", "to_v"]  # FLUX attention projections
+
+# Data Configuration
+data:
+  output_dir: "./output_data"
+  train_split: 0.9
+  val_split: 0.1
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+
+# Logging Configuration
+logging:
+  log_every_n_steps: 100
+  log_dir: "./runs/logs"
+  tensorboard: true
+  
+  # TensorBoard metrics to log
+  metrics:
+    - "loss/flow_matching"
+    - "loss/total"
+    - "metrics/alpha_mean"
+    - "metrics/alpha_fg_ratio"
+    - "metrics/learning_rate"
+    - "metrics/grad_norm"
+
+# Inference Visualization
+inference:
+  enabled: true
+  every_n_steps: 250
+  num_samples: 4
+  num_inference_steps: 28  # FLUX default
+  guidance_scale: 3.5
+  
+  # What to visualize
+  visualizations:
+    - "generated_images"
+    - "ground_truth"
+    - "bbox_overlay"
+    - "alpha_distribution"
+
+# Checkpointing
+checkpointing:
+  save_every_n_steps: 1000
+  checkpoint_dir: "./runs/checkpoints/stage1"
+  keep_last_n_checkpoints: 5
+  save_optimizer_state: true
+  save_scheduler_state: true
+
+# Resume from checkpoint (optional)
+resume_from_checkpoint: null  # Set to checkpoint path to resume
+
+# Random seed for reproducibility
+seed: 42
+
+# Distributed training (Accelerate)
+distributed:
+  mixed_precision: "bf16"
+  gradient_accumulation_steps: 4
+  
+# VAE Configuration (for inference visualization)
+vae:
+  model_path: "/root/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21/vae"
+  scaling_factor: 0.3611
+  
+# DINO Configuration (for identity loss in later stages)
+dino:
+  model_name: "dinov2_vitl14"
+  
+# Flow Matching Configuration
+flow_matching:
+  sigma_min: 0.0
+  sigma_max: 1.0
+  rho: 7.0

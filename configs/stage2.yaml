@@ -1,0 +1,147 @@
+# Stage 2 Configuration: Modulation + Identity Training (150K iterations)
+# Goal: Add identity on top of layout
+
+# Training Stage
+stage: 2
+stage_name: "modulation_identity_training"
+
+# Model Configuration
+model:
+  flux_model_name: "black-forest-labs/FLUX.1-dev"
+  max_refs: 50
+  num_double_blocks: 19
+  num_single_blocks: 38
+  dim: 3072
+  device: "cuda"
+
+# Training Hyperparameters
+training:
+  num_iterations: 150000
+  batch_size: 2
+  gradient_accumulation_steps: 4  # Effective batch size = 8
+  learning_rate: 5.0e-6  # Lower LR for Stage 2 (same as XVerse)
+  warmup_steps: 2000
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+
+# Optimizer
+optimizer:
+  type: "AdamW"
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# Learning Rate Scheduler
+scheduler:
+  type: "cosine"
+  num_warmup_steps: 2000
+  num_training_steps: 150000
+
+# Loss Weights (Stage 2: Flow matching + DINO identity)
+loss_weights:
+  flow_matching: 1.0
+  dino_identity: 10.0  # Strong weight for identity preservation
+  region_preservation: 0.0  # Placeholder
+
+# Layer Freezing (Stage 2)
+freeze:
+  flux_transformer: true
+  clip_encoder: true
+  dino_encoder: true
+  vae: true
+  feedback_bridge: true  # Still frozen in Stage 2
+
+trainable:
+  alpha_predictor: true
+  instance_fusion_mlp: true
+  layout_head: true
+  assemble_attn_lora: true
+  modulation_head: true  # UNFROZEN in Stage 2
+  per_block_adaln_projections: true  # UNFROZEN in Stage 2
+
+# LoRA Configuration
+lora:
+  rank: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules: ["to_q", "to_k", "to_v"]
+
+# Data Configuration
+data:
+  output_dir: "./output_data"
+  train_split: 0.9
+  val_split: 0.1
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+
+# Logging Configuration
+logging:
+  log_every_n_steps: 100
+  log_dir: "./runs/logs"
+  tensorboard: true
+  
+  # TensorBoard metrics to log
+  metrics:
+    - "loss/flow_matching"
+    - "loss/dino_identity"
+    - "loss/dino_identity_weighted"
+    - "loss/total"
+    - "metrics/alpha_mean"
+    - "metrics/alpha_fg_ratio"
+    - "metrics/dino_similarity_mean"
+    - "metrics/learning_rate"
+    - "metrics/grad_norm"
+
+# Inference Visualization
+inference:
+  enabled: true
+  every_n_steps: 100
+  num_samples: 4
+  num_inference_steps: 28
+  guidance_scale: 3.5
+  
+  # What to visualize
+  visualizations:
+    - "generated_images"
+    - "ground_truth"
+    - "bbox_overlay"
+    - "alpha_distribution"
+    - "per_object_crops"  # Added for identity comparison
+
+# Checkpointing
+checkpointing:
+  save_every_n_steps: 100
+  checkpoint_dir: "./runs/checkpoints/stage2"
+  keep_last_n_checkpoints: 5
+  save_optimizer_state: true
+  save_scheduler_state: true
+
+# Resume from checkpoint (should load Stage 1 final checkpoint)
+# Set via CLI argument: --resume_from_checkpoint runs/checkpoints/stage1/checkpoint_XXXXX
+resume_from_checkpoint: null
+
+# Random seed for reproducibility
+seed: 42
+
+# Distributed training (Accelerate)
+distributed:
+  mixed_precision: "bf16"
+  gradient_accumulation_steps: 4
+
+# VAE Configuration
+vae:
+  model_path: "/root/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21/vae"
+  scaling_factor: 0.3611
+
+# DINO Configuration (for identity loss)
+dino:
+  model_name: "dinov2_vitl14"
+  freeze: true  # DINO encoder is frozen
+
+# Flow Matching Configuration
+flow_matching:
+  sigma_min: 0.0
+  sigma_max: 1.0
+  rho: 7.0

@@ -1,0 +1,148 @@
+# Stage 3 Configuration: Feedback Bridge Fine-tuning (10K iterations)
+# Goal: Fine-tune feedback bridge for cross-block communication
+
+# Training Stage
+stage: 3
+stage_name: "feedback_bridge_finetuning"
+
+# Model Configuration
+model:
+  flux_model_name: "black-forest-labs/FLUX.1-dev"
+  max_refs: 50
+  num_double_blocks: 19
+  num_single_blocks: 38
+  dim: 3072
+  device: "cuda"
+
+# Training Hyperparameters
+training:
+  num_iterations: 10000
+  batch_size: 2
+  gradient_accumulation_steps: 4  # Effective batch size = 8
+  learning_rate: 1.0e-5  # Medium LR for fine-tuning
+  warmup_steps: 500
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+
+# Optimizer
+optimizer:
+  type: "AdamW"
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# Learning Rate Scheduler
+scheduler:
+  type: "cosine"
+  num_warmup_steps: 500
+  num_training_steps: 10000
+
+# Loss Weights (Stage 3: Same as Stage 2)
+loss_weights:
+  flow_matching: 1.0
+  dino_identity: 10.0
+  region_preservation: 0.0
+
+# Layer Freezing (Stage 3: Only feedback bridge trainable)
+freeze:
+  flux_transformer: true
+  clip_encoder: true
+  dino_encoder: true
+  vae: true
+  alpha_predictor: true  # FROZEN in Stage 3
+  instance_fusion_mlp: true  # FROZEN in Stage 3
+  layout_head: true  # FROZEN in Stage 3
+  assemble_attn_lora: true  # FROZEN in Stage 3
+  modulation_head: true  # FROZEN in Stage 3
+  per_block_adaln_projections: true  # FROZEN in Stage 3
+
+trainable:
+  feedback_bridge: true  # ONLY trainable component in Stage 3
+
+# LoRA Configuration (for feedback bridge)
+lora:
+  rank: 16  # Lower rank for feedback bridge
+  alpha: 16
+  dropout: 0.0
+  target_modules: ["feedback_projections"]
+
+# Data Configuration
+data:
+  output_dir: "./output_data"
+  train_split: 0.9
+  val_split: 0.1
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+
+# Logging Configuration
+logging:
+  log_every_n_steps: 50  # More frequent logging for short stage
+  log_dir: "./runs/logs"
+  tensorboard: true
+  
+  # TensorBoard metrics to log
+  metrics:
+    - "loss/flow_matching"
+    - "loss/dino_identity"
+    - "loss/dino_identity_weighted"
+    - "loss/total"
+    - "metrics/alpha_mean"
+    - "metrics/alpha_fg_ratio"
+    - "metrics/dino_similarity_mean"
+    - "metrics/feedback_magnitude"  # New metric for Stage 3
+    - "metrics/learning_rate"
+    - "metrics/grad_norm"
+
+# Inference Visualization
+inference:
+  enabled: true
+  every_n_steps: 100  # More frequent for short stage
+  num_samples: 4
+  num_inference_steps: 28
+  guidance_scale: 3.5
+  
+  # What to visualize
+  visualizations:
+    - "generated_images"
+    - "ground_truth"
+    - "bbox_overlay"
+    - "alpha_distribution"
+    - "per_object_crops"
+
+# Checkpointing
+checkpointing:
+  save_every_n_steps: 100  # More frequent for short stage
+  checkpoint_dir: "./runs/checkpoints/stage3"
+  keep_last_n_checkpoints: 5
+  save_optimizer_state: true
+  save_scheduler_state: true
+
+# Resume from checkpoint (should load Stage 2 final checkpoint)
+# Set via CLI argument: --resume_from_checkpoint runs/checkpoints/stage2/checkpoint_XXXXX
+resume_from_checkpoint: null
+
+# Random seed for reproducibility
+seed: 42
+
+# Distributed training (Accelerate)
+distributed:
+  mixed_precision: "bf16"
+  gradient_accumulation_steps: 4
+
+# VAE Configuration
+vae:
+  model_path: "/root/.cache/huggingface/hub/models--black-forest-labs--FLUX.1-dev/snapshots/3de623fc3c33e44ffbe2bad470d0f45bccf2eb21/vae"
+  scaling_factor: 0.3611
+
+# DINO Configuration
+dino:
+  model_name: "dinov2_vitl14"
+  freeze: true
+
+# Flow Matching Configuration
+flow_matching:
+  sigma_min: 0.0
+  sigma_max: 1.0
+  rho: 7.0
