@@ -5,7 +5,7 @@ import sys
 import os
 
 from modules.alpha_predictor import AlphaPredictor, depth_label_to_onehot, compute_bbox_area_ratio
-from modules.instance_encoder import encode_spatial_features, encode_visual_features, InstanceFusionMLP
+from modules.instance_encoder import encode_spatial_features, InstanceFusionMLP
 from modules.layout_module import LayoutHead, LayoutIntegrator
 from modules.modulation_modules import ModulationHead, ModulationIntegrator
 from modules.feedback_bridge import FeedbackBridge
@@ -38,6 +38,7 @@ class MoviePostProductionModel(nn.Module):
         num_double_blocks: int = 19,
         num_single_blocks: int = 38,
         dim: int = 3072,
+        clip_embedding_dim: int = 512,
         device: str = 'cuda',
     ):
         super().__init__()
@@ -47,7 +48,7 @@ class MoviePostProductionModel(nn.Module):
         self.dim = dim
         self.device = device
         
-        self.alpha_predictor = AlphaPredictor().to(device).to(torch.bfloat16)
+        self.alpha_predictor = AlphaPredictor(clip_dim=clip_embedding_dim).to(device).to(torch.bfloat16)
         self.instance_fusion_mlp = InstanceFusionMLP().to(device).to(torch.bfloat16)
         self.layout_head = LayoutHead(dim=dim).to(device).to(torch.bfloat16)
         self.modulation_head = ModulationHead(
@@ -63,8 +64,12 @@ class MoviePostProductionModel(nn.Module):
             num_blocks=num_double_blocks,
             num_adaln_params=12,
         ).to(device).to(torch.bfloat16)
+        # Use a single layout head instance so optimizer updates affect the live layout path.
+        self.layout_integrator.assemble_addon.layout_head = self.layout_head
         
-        self.clip_proj = None
+        self.clip_proj = nn.Linear(clip_embedding_dim, 1024).to(device).to(torch.bfloat16)
+        nn.init.xavier_uniform_(self.clip_proj.weight)
+        nn.init.zeros_(self.clip_proj.bias)
         
         print(f"Initializing FLUX transformer from {flux_model_name}...")
         try:
@@ -120,16 +125,13 @@ class MoviePostProductionModel(nn.Module):
         device = bboxes.device
         
         clip_dim = clip_embeddings.shape[-1]
-        # Get the target dtype from alpha_predictor (will be float32 if trainable, bfloat16 if frozen)
-        target_dtype = next(self.alpha_predictor.parameters()).dtype
-        
-        if self.clip_proj is None:
-            self.clip_proj = nn.Linear(clip_dim, 1024).to(device).to(target_dtype)
-            nn.init.xavier_uniform_(self.clip_proj.weight)
-            nn.init.zeros_(self.clip_proj.bias)
-        
-        if not hasattr(self.alpha_predictor, 'clip_dim') or self.alpha_predictor.clip_dim != clip_dim:
-            self.alpha_predictor = AlphaPredictor(clip_dim=clip_dim).to(device).to(target_dtype)
+        # All trainable modules must be created in __init__; never create/replace here.
+        expected_clip_dim = self.alpha_predictor.clip_dim
+        if clip_dim != expected_clip_dim:
+            raise ValueError(
+                f"clip_embeddings dim ({clip_dim}) does not match configured alpha_predictor clip_dim ({expected_clip_dim}). "
+                "Set model.clip_embedding_dim in config to match your dataset embeddings."
+            )
         
         alpha_list = []
         instance_tokens_list = []
@@ -163,10 +165,12 @@ class MoviePostProductionModel(nn.Module):
                 
                 spatial_feat = encode_spatial_features(bbox_xywh, device=device)
                 
-                if alpha < 0.5:
-                    visual_feat = encode_visual_features(clip_emb, alpha.item(), device=device, clip_proj=self.clip_proj)
-                else:
-                    visual_feat = dino_emb
+                # Differentiable blend: avoid hard threshold and .item(), which block alpha learning.
+                clip_proj_dtype = next(self.clip_proj.parameters()).dtype
+                clip_feat = self.clip_proj(clip_emb.to(clip_proj_dtype)).to(device)
+                dino_feat = dino_emb.to(clip_feat.dtype)
+                alpha_blend = alpha.to(clip_feat.dtype).clamp(0.0, 1.0)
+                visual_feat = (1.0 - alpha_blend) * clip_feat + alpha_blend * dino_feat
                 
                 # Convert to module dtype (float32 if trainable, bfloat16 if frozen)
                 module_dtype = next(self.instance_fusion_mlp.parameters()).dtype

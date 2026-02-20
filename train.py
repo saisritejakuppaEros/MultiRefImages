@@ -50,6 +50,7 @@ def setup_model(config: Dict, accelerator: Accelerator) -> MoviePostProductionMo
         num_double_blocks=config['model']['num_double_blocks'],
         num_single_blocks=config['model']['num_single_blocks'],
         dim=config['model']['dim'],
+        clip_embedding_dim=config['model'].get('clip_embedding_dim', 512),
         device=accelerator.device,
     )
     
@@ -79,11 +80,19 @@ def setup_model(config: Dict, accelerator: Accelerator) -> MoviePostProductionMo
     # Apply layer freezing based on stage
     freeze_config = config.get('freeze', {})
     
-    # Freeze FLUX transformer
+    # Freeze FLUX transformer (keep LoRA trainable when enabled)
     if freeze_config.get('flux_transformer', True):
-        for param in model.flux_transformer.parameters():
-            param.requires_grad = False
-        accelerator.print("✓ Frozen FLUX transformer")
+        lora_enabled = trainable_config.get('assemble_attn_lora', False)
+        lora_trainable_count = 0
+        for name, param in model.flux_transformer.named_parameters():
+            if lora_enabled and 'lora_' in name:
+                param.requires_grad = True
+                lora_trainable_count += 1
+            else:
+                param.requires_grad = False
+        accelerator.print("✓ Frozen FLUX transformer base weights")
+        if lora_enabled:
+            accelerator.print(f"✓ Kept LoRA trainable tensors: {lora_trainable_count}")
     
     # Handle trainable modules - convert to float32 for gradient compatibility
     # This is necessary because PyTorch autograd doesn't fully support bfloat16 gradients
@@ -471,6 +480,79 @@ def log_to_tensorboard(
         writer.add_scalar(key, value, iteration)
 
 
+def collect_grad_diagnostics(model: nn.Module) -> Dict[str, float]:
+    """Collect gradient diagnostics for TensorBoard debug logging."""
+    total_grad_sq = 0.0
+    total_trainable = 0
+    total_with_grad = 0
+
+    lora_grad_sq = 0.0
+    lora_trainable = 0
+    lora_with_grad = 0
+    lora_grad_abs_mean_sum = 0.0
+    lora_param_abs_mean_sum = 0.0
+    module_grad_sq = {
+        'alpha_predictor': 0.0,
+        'instance_fusion_mlp': 0.0,
+        'layout_head': 0.0,
+        'modulation_head': 0.0,
+        'feedback_bridge': 0.0,
+    }
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        total_trainable += 1
+        is_lora = 'lora_' in name
+        if is_lora:
+            lora_trainable += 1
+            lora_param_abs_mean_sum += param.detach().float().abs().mean().item()
+
+        grad = param.grad
+        if grad is None:
+            continue
+
+        total_with_grad += 1
+        grad_f = grad.detach().float()
+        total_grad_sq += grad_f.pow(2).sum().item()
+        grad_sq = grad_f.pow(2).sum().item()
+
+        if is_lora:
+            lora_with_grad += 1
+            lora_grad_sq += grad_sq
+            lora_grad_abs_mean_sum += grad_f.abs().mean().item()
+        elif name.startswith('alpha_predictor.'):
+            module_grad_sq['alpha_predictor'] += grad_sq
+        elif name.startswith('instance_fusion_mlp.'):
+            module_grad_sq['instance_fusion_mlp'] += grad_sq
+        elif name.startswith('layout_head.'):
+            module_grad_sq['layout_head'] += grad_sq
+        elif name.startswith('modulation_head.'):
+            module_grad_sq['modulation_head'] += grad_sq
+        elif name.startswith('feedback_bridge.'):
+            module_grad_sq['feedback_bridge'] += grad_sq
+
+    lora_with_grad_ratio = (lora_with_grad / max(lora_trainable, 1)) if lora_trainable > 0 else 0.0
+    total_with_grad_ratio = (total_with_grad / max(total_trainable, 1)) if total_trainable > 0 else 0.0
+
+    metrics = {
+        'debug/grad_norm_total': float(np.sqrt(total_grad_sq)),
+        'debug/grad_norm_lora': float(np.sqrt(lora_grad_sq)),
+        'debug/trainable_tensors': float(total_trainable),
+        'debug/trainable_tensors_with_grad': float(total_with_grad),
+        'debug/trainable_with_grad_ratio': float(total_with_grad_ratio),
+        'debug/lora_trainable_tensors': float(lora_trainable),
+        'debug/lora_tensors_with_grad': float(lora_with_grad),
+        'debug/lora_with_grad_ratio': float(lora_with_grad_ratio),
+        'debug/lora_grad_abs_mean': float(lora_grad_abs_mean_sum / max(lora_with_grad, 1)),
+        'debug/lora_param_abs_mean': float(lora_param_abs_mean_sum / max(lora_trainable, 1)),
+    }
+    for module_name, grad_sq in module_grad_sq.items():
+        metrics[f'debug/grad_norm_{module_name}'] = float(np.sqrt(grad_sq))
+    return metrics
+
+
 def run_flow_matching_denoising(
     model: nn.Module,
     noise: torch.Tensor,
@@ -779,13 +861,34 @@ def main():
     accelerator.print("Initializing model...")
     model = setup_model(config, accelerator)
     
-    # Setup optimizer
+    # Setup optimizer with separate LoRA LR to reduce generation distortion.
+    base_lr = config['training']['learning_rate']
+    lora_lr = config.get('lora', {}).get('learning_rate', base_lr * 0.1)
+    lora_params = []
+    base_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if 'lora_' in name:
+            lora_params.append(param)
+        else:
+            base_params.append(param)
+
+    optimizer_param_groups = []
+    if base_params:
+        optimizer_param_groups.append({'params': base_params, 'lr': base_lr})
+    if lora_params:
+        optimizer_param_groups.append({'params': lora_params, 'lr': lora_lr})
+
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=config['training']['learning_rate'],
+        optimizer_param_groups,
         betas=config['optimizer']['betas'],
         eps=config['optimizer']['eps'],
         weight_decay=config['training']['weight_decay'],
+    )
+    accelerator.print(
+        f"Optimizer param groups - base: {len(base_params)} tensors @ {base_lr:.2e}, "
+        f"lora: {len(lora_params)} tensors @ {lora_lr:.2e}"
     )
     
     # Setup scheduler
@@ -843,6 +946,7 @@ def main():
             train_iterator = iter(train_dataloader)
             batch = next(train_iterator)
         
+        grad_debug_metrics = {}
         with accelerator.accumulate(model):
             # Get batch data and convert to bfloat16
             latents = batch['latents'].to(torch.bfloat16)  # (B, 16, H, W)
@@ -924,8 +1028,17 @@ def main():
             # Backward pass
             accelerator.backward(loss)
             
+            next_global_step = global_step + 1 if accelerator.sync_gradients else global_step
+            should_log_this_step = (
+                accelerator.sync_gradients
+                and accelerator.is_main_process
+                and next_global_step % config['logging']['log_every_n_steps'] == 0
+            )
+
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), config['training']['max_grad_norm'])
+                if should_log_this_step:
+                    grad_debug_metrics = collect_grad_diagnostics(accelerator.unwrap_model(model))
             
             optimizer.step()
             scheduler.step()
@@ -947,8 +1060,12 @@ def main():
                     'metrics/alpha_mean': alpha_mean,
                     'metrics/alpha_fg_ratio': alpha_fg_ratio,
                     'metrics/learning_rate': scheduler.get_last_lr()[0],
+                    'metrics/learning_rate_base': optimizer.param_groups[0]['lr'],
                     'metrics/timestep_mean': timesteps.mean().item(),
                 }
+                if len(optimizer.param_groups) > 1:
+                    metrics['metrics/learning_rate_lora'] = optimizer.param_groups[1]['lr']
+                metrics.update(grad_debug_metrics)
                 
                 # Log to TensorBoard
                 log_to_tensorboard(writer, metrics, global_step)
