@@ -117,8 +117,12 @@ def prepare_multi_ip(
     prompt: str | list[str],
     ref_imgs: list[Tensor] | None = None,
     pe: Literal['d', 'h', 'w', 'o'] = 'd'
-) -> dict[str, Tensor]:
+) -> dict:
     assert pe in ['d', 'h', 'w', 'o']
+    ref_imgs = ref_imgs or []
+    if len(ref_imgs) == 0:
+        return prepare(t5, clip, img, prompt, ref_img=None, pe=pe)
+
     bs, c, h, w = img.shape
     if bs == 1 and not isinstance(prompt, str):
         bs = len(prompt)
@@ -250,3 +254,66 @@ def unpack(x: Tensor, height: int, width: int) -> Tensor:
         ph=2,
         pw=2,
     )
+
+
+def prepare_hybrid_ip(
+    t5: HFEmbedder,
+    clip: HFEmbedder,
+    img: Tensor,
+    prompt: str | list[str],
+    vae_ref_imgs: list[Tensor],
+    hybrid_layout,
+    latent_hw: tuple[int, int],
+    pe: Literal['d', 'h', 'w', 'o'] = 'd',
+    device: torch.device = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> dict:
+    """Combines prepare_multi_ip (Path A) with HybridLayout.build_layout_kwargs (Path B)."""
+    base = prepare_multi_ip(t5=t5, clip=clip, img=img, prompt=prompt, ref_imgs=vae_ref_imgs, pe=pe)
+    layout_kwargs = hybrid_layout.build_layout_kwargs(
+        device=device or img.device,
+        dtype=dtype,
+        latent_hw=latent_hw,
+    )
+    base["layout_kwargs"] = layout_kwargs
+    return base
+
+
+def denoise_hybrid(
+    model: Flux,
+    img: Tensor,
+    img_ids: Tensor,
+    txt: Tensor,
+    txt_ids: Tensor,
+    vec: Tensor,
+    timesteps: list[float],
+    guidance: float = 4.0,
+    ref_img=None,
+    ref_img_ids=None,
+    layout_kwargs: dict | None = None,
+    layout_scale: float = 1.0,
+    grounding_ratio: float = 0.3,
+):
+    """Drop-in replacement for denoise() that passes layout args to the model."""
+    total_steps = len(timesteps) - 1
+    guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
+    for step_idx, (t_curr, t_prev) in enumerate(tqdm(zip(timesteps[:-1], timesteps[1:]), total=total_steps)):
+        t_vec = torch.full((img.shape[0],), t_curr, dtype=img.dtype, device=img.device)
+        current_step_ratio = step_idx / max(total_steps, 1)
+        pred = model(
+            img=img,
+            img_ids=img_ids,
+            ref_img=ref_img,
+            ref_img_ids=ref_img_ids,
+            txt=txt,
+            txt_ids=txt_ids,
+            y=vec,
+            timesteps=t_vec,
+            guidance=guidance_vec,
+            layout_kwargs=layout_kwargs,
+            layout_scale=layout_scale,
+            grounding_ratio=grounding_ratio,
+            current_step_ratio=current_step_ratio,
+        )
+        img = img + (t_prev - t_curr) * pred
+    return img

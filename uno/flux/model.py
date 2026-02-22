@@ -19,6 +19,7 @@ import torch
 from torch import Tensor, nn
 
 from .modules.layers import DoubleStreamBlock, EmbedND, LastLayer, MLPEmbedder, SingleStreamBlock, timestep_embedding
+from .modules.layout import EmbedBboxProjection
 
 
 @dataclass
@@ -87,7 +88,24 @@ class Flux(nn.Module):
         )
 
         self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
+        self.layout_net = EmbedBboxProjection(
+            embed_dim=768,
+            out_dim=self.hidden_size,
+            fourier_freqs=8,
+            point_num=6,
+        )
         self.gradient_checkpointing = False
+
+    def enable_layout(
+        self,
+        double_block_indices: list[int] | None = None,
+        single_block_indices: list[int] | None = None,
+    ):
+        """Enable layout conditioning on specified blocks. None = all blocks."""
+        for i, b in enumerate(self.double_blocks):
+            b.use_layout = double_block_indices is None or i in double_block_indices
+        for i, b in enumerate(self.single_blocks):
+            b.use_layout = single_block_indices is None or i in single_block_indices
 
     def _set_gradient_checkpointing(self, module, value=False):
         if hasattr(module, "gradient_checkpointing"):
@@ -155,8 +173,12 @@ class Flux(nn.Module):
         timesteps: Tensor,
         y: Tensor,
         guidance: Tensor | None = None,
-        ref_img: Tensor | None = None, 
-        ref_img_ids: Tensor | None = None, 
+        ref_img: Tensor | None = None,
+        ref_img_ids: Tensor | None = None,
+        layout_kwargs: dict | None = None,
+        layout_scale: float = 1.0,
+        grounding_ratio: float = 0.3,
+        current_step_ratio: float = 1.0,
     ) -> Tensor:
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Input img and txt tensors must have 3 dimensions.")
@@ -184,35 +206,78 @@ class Flux(nn.Module):
                 img = torch.cat((img, self.img_in(ref_img)), dim=1)  
                 ids = torch.cat((ids, ref_img_ids), dim=1)
         pe = self.pe_embedder(ids)
-        
+
+        layout_hidden_states = None
+        img_idxs_list = None
+        layout_masks = None
+        effective_layout_scale = 0.0
+        if layout_kwargs is not None and layout_kwargs.get("layout") is not None and current_step_ratio <= grounding_ratio:
+            lk = layout_kwargs["layout"]
+            layout_hidden_states = self.layout_net(
+                boxes=lk["boxes"],
+                masks=lk["masks"],
+                embeddings=lk["embeddings"],
+            )
+            img_idxs_list = [lk["img_idxs_list"]]
+            layout_masks = lk["masks"]
+            effective_layout_scale = layout_scale
+
         for index_block, block in enumerate(self.double_blocks):
             if self.training and self.gradient_checkpointing:
-                img, txt = torch.utils.checkpoint.checkpoint(
+                result = torch.utils.checkpoint.checkpoint(
                     block,
-                    img=img, 
-                    txt=txt, 
-                    vec=vec, 
-                    pe=pe, 
+                    img,
+                    txt,
+                    vec,
+                    pe,
+                    layout_hidden_states=layout_hidden_states,
+                    layout_masks=layout_masks,
+                    img_idxs_list=img_idxs_list,
+                    layout_scale=effective_layout_scale,
                     use_reentrant=False,
                 )
+                img, txt, layout_hidden_states = result
+
             else:
-                img, txt = block(
-                    img=img, 
-                    txt=txt, 
-                    vec=vec, 
-                    pe=pe
+                img, txt, layout_hidden_states = block(
+                    img=img,
+                    txt=txt,
+                    vec=vec,
+                    pe=pe,
+                    layout_hidden_states=layout_hidden_states,
+                    layout_masks=layout_masks,
+                    img_idxs_list=img_idxs_list,
+                    layout_scale=effective_layout_scale,
                 )
 
         img = torch.cat((txt, img), 1)
+        txt_len = txt.shape[1]
         for block in self.single_blocks:
             if self.training and self.gradient_checkpointing:
-                img = torch.utils.checkpoint.checkpoint(
+                result = torch.utils.checkpoint.checkpoint(
                     block,
-                    img, vec=vec, pe=pe,
-                    use_reentrant=False
+                    img,
+                    vec,
+                    pe,
+                    txt_len=txt_len,
+                    layout_hidden_states=layout_hidden_states,
+                    layout_masks=layout_masks,
+                    img_idxs_list=img_idxs_list,
+                    layout_scale=effective_layout_scale,
+                    use_reentrant=False,
                 )
+                img, layout_hidden_states = result
             else:
-                img = block(img, vec=vec, pe=pe)
+                img, layout_hidden_states = block(
+                    img,
+                    vec=vec,
+                    pe=pe,
+                    txt_len=txt_len,
+                    layout_hidden_states=layout_hidden_states,
+                    layout_masks=layout_masks,
+                    img_idxs_list=img_idxs_list,
+                    layout_scale=effective_layout_scale,
+                )
         img = img[:, txt.shape[1] :, ...]
         # index img
         img = img[:, :img_end, ...]

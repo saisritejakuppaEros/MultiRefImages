@@ -184,3 +184,5 @@ output/
 
 log/
 datasets/UNO-1M/
+models/
+data/

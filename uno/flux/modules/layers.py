@@ -21,6 +21,7 @@ from einops import rearrange
 from torch import Tensor, nn
 
 from ..math import attention, rope
+from .layout import zero_module
 import torch.nn.functional as F
 
 class EmbedND(nn.Module):
@@ -297,6 +298,13 @@ class DoubleStreamBlock(nn.Module):
         processor = DoubleStreamBlockProcessor()
         self.set_processor(processor)
 
+        self.use_layout = False
+        self.layout_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.layout_q = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.layout_k = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.layout_v = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.layout_out = zero_module(nn.Linear(hidden_size, hidden_size, bias=True))
+
     def set_processor(self, processor) -> None:
         self.processor = processor
 
@@ -310,12 +318,65 @@ class DoubleStreamBlock(nn.Module):
         vec: Tensor,
         pe: Tensor,
         image_proj: Tensor = None,
-        ip_scale: float =1.0,
-    ) -> tuple[Tensor, Tensor]:
+        ip_scale: float = 1.0,
+        layout_hidden_states: Tensor | None = None,
+        layout_masks: Tensor | None = None,
+        img_idxs_list: list | None = None,
+        layout_scale: float = 1.0,
+    ) -> tuple[Tensor, Tensor, Tensor | None]:
         if image_proj is None:
-            return self.processor(self, img, txt, vec, pe)
+            img, txt = self.processor(self, img, txt, vec, pe)
         else:
-            return self.processor(self, img, txt, vec, pe, image_proj, ip_scale)
+            img, txt = self.processor(self, img, txt, vec, pe, image_proj, ip_scale)
+
+        if (
+            self.use_layout
+            and layout_hidden_states is not None
+            and layout_masks is not None
+            and img_idxs_list is not None
+            and layout_scale != 0.0
+        ):
+            bsz = img.shape[0]
+            hidden_states_add = torch.zeros_like(img)
+            layout_hidden_add = torch.zeros_like(layout_hidden_states)
+            valid = (layout_masks == 1).nonzero(as_tuple=False)
+
+            for k in range(valid.shape[0]):
+                i = valid[k, 0].item()
+                j = valid[k, 1].item()
+                if i < len(img_idxs_list) and j < len(img_idxs_list[i]):
+                    idxs = img_idxs_list[i][j]
+                    if idxs.numel() == 0:
+                        continue
+                    img_idxs = idxs.to(img.device, dtype=torch.long)
+
+                    region_tokens = img[i, img_idxs]
+                    obj_token = layout_hidden_states[i, j].unsqueeze(0)
+                    context = torch.cat([obj_token, region_tokens], dim=0).unsqueeze(0)
+                    context_norm = self.layout_norm(context)
+
+                    q = self.layout_q(context_norm[:, :1])
+                    k_ = self.layout_k(context_norm)
+                    v_ = self.layout_v(context_norm)
+
+                    scale = q.shape[-1] ** -0.5
+                    attn_w = torch.softmax((q @ k_.transpose(-2, -1)) * scale, dim=-1)
+                    attn_out = (attn_w @ v_).squeeze(0)
+
+                    delta = layout_scale * self.layout_out(attn_out)
+                    # delta may be [3072], [1,3072], or [1,1,3072]; ensure 2D [1, C] for expand
+                    delta_2d = delta.reshape(1, -1).expand(img_idxs.shape[0], -1)
+                    hidden_states_add[i].scatter_add_(
+                        0,
+                        img_idxs.unsqueeze(-1).expand(-1, img.shape[-1]),
+                        delta_2d,
+                    )
+                    layout_hidden_add[i, j] = delta.reshape(-1)
+
+            img = img + hidden_states_add
+            layout_hidden_states = layout_hidden_states + layout_hidden_add
+
+        return img, txt, layout_hidden_states
 
 
 class SingleStreamBlockLoraProcessor(nn.Module):
@@ -399,6 +460,12 @@ class SingleStreamBlock(nn.Module):
         processor = SingleStreamBlockProcessor()
         self.set_processor(processor)
 
+        self.use_layout = False
+        self.layout_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.layout_q = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.layout_k = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.layout_v = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.layout_out = zero_module(nn.Linear(hidden_size, hidden_size, bias=True))
 
     def set_processor(self, processor) -> None:
         self.processor = processor
@@ -413,11 +480,66 @@ class SingleStreamBlock(nn.Module):
         pe: Tensor,
         image_proj: Tensor | None = None,
         ip_scale: float = 1.0,
-    ) -> Tensor:
+        txt_len: int = 0,
+        layout_hidden_states: Tensor | None = None,
+        layout_masks: Tensor | None = None,
+        img_idxs_list: list | None = None,
+        layout_scale: float = 1.0,
+    ) -> tuple[Tensor, Tensor | None]:
         if image_proj is None:
-            return self.processor(self, x, vec, pe)
+            x = self.processor(self, x, vec, pe)
         else:
-            return self.processor(self, x, vec, pe, image_proj, ip_scale)
+            x = self.processor(self, x, vec, pe, image_proj, ip_scale)
+
+        if (
+            self.use_layout
+            and layout_hidden_states is not None
+            and layout_masks is not None
+            and img_idxs_list is not None
+            and layout_scale != 0.0
+            and txt_len > 0
+        ):
+            img = x[:, txt_len:]
+            bsz, img_len, hs = img.shape
+            hidden_states_add = torch.zeros_like(img)
+            layout_hidden_add = torch.zeros_like(layout_hidden_states)
+            valid = (layout_masks == 1).nonzero(as_tuple=False)
+
+            for k in range(valid.shape[0]):
+                i = valid[k, 0].item()
+                j = valid[k, 1].item()
+                if i < len(img_idxs_list) and j < len(img_idxs_list[i]):
+                    idxs = img_idxs_list[i][j]
+                    if idxs.numel() == 0:
+                        continue
+                    img_idxs = idxs.to(img.device, dtype=torch.long)
+
+                    region_tokens = img[i, img_idxs]
+                    obj_token = layout_hidden_states[i, j].unsqueeze(0)
+                    context = torch.cat([obj_token, region_tokens], dim=0).unsqueeze(0)
+                    context_norm = self.layout_norm(context)
+
+                    q = self.layout_q(context_norm[:, :1])
+                    k_ = self.layout_k(context_norm)
+                    v_ = self.layout_v(context_norm)
+
+                    scale = q.shape[-1] ** -0.5
+                    attn_w = torch.softmax((q @ k_.transpose(-2, -1)) * scale, dim=-1)
+                    attn_out = (attn_w @ v_).squeeze(0)
+
+                    delta = layout_scale * self.layout_out(attn_out)
+                    delta_2d = delta.reshape(1, -1).expand(img_idxs.shape[0], -1)
+                    hidden_states_add[i].scatter_add_(
+                        0,
+                        img_idxs.unsqueeze(-1).expand(-1, hs),
+                        delta_2d,
+                    )
+                    layout_hidden_add[i, j] = delta.reshape(-1)
+
+            x = torch.cat([x[:, :txt_len], img + hidden_states_add], dim=1)
+            layout_hidden_states = layout_hidden_states + layout_hidden_add
+            return x, layout_hidden_states
+        return x, None
 
 
 
