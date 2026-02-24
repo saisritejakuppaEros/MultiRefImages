@@ -1,0 +1,18 @@
+{
+  "training_phase": 3,
+  "phase1_ckpt": "log/phase1/checkpoint-5000/hybrid_lora_layout.safetensors",
+  "phase2_ckpt": "log/phase2/checkpoint-8000/hybrid_lora_layout.safetensors",
+  "max_vae_refs": 4,
+  "max_clip_objs": 50,
+  "grounding_ratio": 0.3,
+  "layout_scale": 1.0,
+  "layout_warmup_steps": 1000,
+  "layout_lr_multiplier": 0.3,
+  "layout_double_blocks": [0, 2, 4, 6, 8, 10, 12],
+  "layout_single_blocks": [0],
+  "learning_rate": 8e-5,
+  "max_train_steps": 15000,
+  "checkpointing_steps": 2000,
+  "project_dir": "log/phase3",
+  "log_dir": "log/phase3"
+}

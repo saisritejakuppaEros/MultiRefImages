@@ -299,11 +299,19 @@ class DoubleStreamBlock(nn.Module):
         self.set_processor(processor)
 
         self.use_layout = False
+        self.num_layout_heads = 8
+        self.layout_mod = Modulation(hidden_size, double=False)
         self.layout_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.layout_q = nn.Linear(hidden_size, hidden_size, bias=True)
         self.layout_k = nn.Linear(hidden_size, hidden_size, bias=True)
         self.layout_v = nn.Linear(hidden_size, hidden_size, bias=True)
         self.layout_out = zero_module(nn.Linear(hidden_size, hidden_size, bias=True))
+        nn.init.normal_(self.layout_q.weight, std=0.02)
+        nn.init.zeros_(self.layout_q.bias)
+        nn.init.normal_(self.layout_k.weight, std=0.02)
+        nn.init.zeros_(self.layout_k.bias)
+        nn.init.normal_(self.layout_v.weight, std=0.02)
+        nn.init.zeros_(self.layout_v.bias)
 
     def set_processor(self, processor) -> None:
         self.processor = processor
@@ -338,42 +346,60 @@ class DoubleStreamBlock(nn.Module):
         ):
             bsz = img.shape[0]
             hidden_states_add = torch.zeros_like(img)
+            density_map = torch.zeros(bsz, img.shape[1], 1, device=img.device, dtype=img.dtype)
             layout_hidden_add = torch.zeros_like(layout_hidden_states)
             valid = (layout_masks == 1).nonzero(as_tuple=False)
 
             for k in range(valid.shape[0]):
                 i = valid[k, 0].item()
                 j = valid[k, 1].item()
-                if i < len(img_idxs_list) and j < len(img_idxs_list[i]):
-                    idxs = img_idxs_list[i][j]
-                    if idxs.numel() == 0:
-                        continue
-                    img_idxs = idxs.to(img.device, dtype=torch.long)
+                if i >= len(img_idxs_list) or j >= len(img_idxs_list[i]):
+                    continue
+                idxs = img_idxs_list[i][j]
+                if idxs.numel() == 0:
+                    continue
+                img_idxs = idxs.to(img.device, dtype=torch.long)
 
-                    region_tokens = img[i, img_idxs]
-                    obj_token = layout_hidden_states[i, j].unsqueeze(0)
-                    context = torch.cat([obj_token, region_tokens], dim=0).unsqueeze(0)
-                    context_norm = self.layout_norm(context)
+                region_tokens = img[i, img_idxs]
+                obj_token = layout_hidden_states[i, j].unsqueeze(0)
+                context = torch.cat([obj_token, region_tokens], dim=0).unsqueeze(0)
 
-                    q = self.layout_q(context_norm[:, :1])
-                    k_ = self.layout_k(context_norm)
-                    v_ = self.layout_v(context_norm)
+                layout_mod_out, _ = self.layout_mod(vec[i : i + 1])
+                context_normed_raw = self.layout_norm(context)
+                context_norm = (1 + layout_mod_out.scale) * context_normed_raw + layout_mod_out.shift
 
-                    scale = q.shape[-1] ** -0.5
-                    attn_w = torch.softmax((q @ k_.transpose(-2, -1)) * scale, dim=-1)
-                    attn_out = (attn_w @ v_).squeeze(0)
+                H = self.num_layout_heads
+                L = context_norm.shape[1]
+                d = context_norm.shape[2]
+                q_h = self.layout_q(context_norm).reshape(1, L, H, d // H).transpose(1, 2)
+                k_h = self.layout_k(context_norm).reshape(1, L, H, d // H).transpose(1, 2)
+                v_h = self.layout_v(context_norm).reshape(1, L, H, d // H).transpose(1, 2)
+                scale_factor = (d // H) ** -0.5
+                attn_out = (torch.softmax((q_h @ k_h.transpose(-2, -1)) * scale_factor, dim=-1) @ v_h)
+                attn_out = attn_out.transpose(1, 2).reshape(1, L, d)
 
-                    delta = layout_scale * self.layout_out(attn_out)
-                    # delta may be [3072], [1,3072], or [1,1,3072]; ensure 2D [1, C] for expand
-                    delta_2d = delta.reshape(1, -1).expand(img_idxs.shape[0], -1)
-                    hidden_states_add[i].scatter_add_(
-                        0,
-                        img_idxs.unsqueeze(-1).expand(-1, img.shape[-1]),
-                        delta_2d,
-                    )
-                    layout_hidden_add[i, j] = delta.reshape(-1)
+                obj_out = attn_out[:, :1]
+                region_out = attn_out[:, 1:]
 
-            img = img + hidden_states_add
+                delta_region = (
+                    layout_mod_out.gate * layout_scale * self.layout_out(region_out.squeeze(0))
+                ).squeeze(0)
+                hidden_states_add[i].scatter_add_(
+                    0,
+                    img_idxs.unsqueeze(-1).expand(-1, img.shape[-1]),
+                    delta_region,
+                )
+                density_map[i].scatter_add_(
+                    0,
+                    img_idxs.unsqueeze(-1),
+                    torch.ones(img_idxs.shape[0], 1, device=img.device, dtype=img.dtype),
+                )
+                layout_hidden_add[i, j] = (
+                    layout_mod_out.gate * layout_scale * self.layout_out(obj_out.squeeze(0))
+                ).squeeze(0).squeeze(0)
+
+            density_map = density_map.clamp(min=1.0)
+            img = img + hidden_states_add / density_map
             layout_hidden_states = layout_hidden_states + layout_hidden_add
 
         return img, txt, layout_hidden_states
@@ -461,11 +487,19 @@ class SingleStreamBlock(nn.Module):
         self.set_processor(processor)
 
         self.use_layout = False
+        self.num_layout_heads = 8
+        self.layout_mod = Modulation(hidden_size, double=False)
         self.layout_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.layout_q = nn.Linear(hidden_size, hidden_size, bias=True)
         self.layout_k = nn.Linear(hidden_size, hidden_size, bias=True)
         self.layout_v = nn.Linear(hidden_size, hidden_size, bias=True)
         self.layout_out = zero_module(nn.Linear(hidden_size, hidden_size, bias=True))
+        nn.init.normal_(self.layout_q.weight, std=0.02)
+        nn.init.zeros_(self.layout_q.bias)
+        nn.init.normal_(self.layout_k.weight, std=0.02)
+        nn.init.zeros_(self.layout_k.bias)
+        nn.init.normal_(self.layout_v.weight, std=0.02)
+        nn.init.zeros_(self.layout_v.bias)
 
     def set_processor(self, processor) -> None:
         self.processor = processor
@@ -502,41 +536,61 @@ class SingleStreamBlock(nn.Module):
             img = x[:, txt_len:]
             bsz, img_len, hs = img.shape
             hidden_states_add = torch.zeros_like(img)
+            density_map = torch.zeros(bsz, img_len, 1, device=img.device, dtype=img.dtype)
             layout_hidden_add = torch.zeros_like(layout_hidden_states)
             valid = (layout_masks == 1).nonzero(as_tuple=False)
 
             for k in range(valid.shape[0]):
                 i = valid[k, 0].item()
                 j = valid[k, 1].item()
-                if i < len(img_idxs_list) and j < len(img_idxs_list[i]):
-                    idxs = img_idxs_list[i][j]
-                    if idxs.numel() == 0:
-                        continue
-                    img_idxs = idxs.to(img.device, dtype=torch.long)
+                if i >= len(img_idxs_list) or j >= len(img_idxs_list[i]):
+                    continue
+                idxs = img_idxs_list[i][j]
+                if idxs.numel() == 0:
+                    continue
+                img_idxs = idxs.to(img.device, dtype=torch.long)
 
-                    region_tokens = img[i, img_idxs]
-                    obj_token = layout_hidden_states[i, j].unsqueeze(0)
-                    context = torch.cat([obj_token, region_tokens], dim=0).unsqueeze(0)
-                    context_norm = self.layout_norm(context)
+                region_tokens = img[i, img_idxs]
+                obj_token = layout_hidden_states[i, j].unsqueeze(0)
+                context = torch.cat([obj_token, region_tokens], dim=0).unsqueeze(0)
 
-                    q = self.layout_q(context_norm[:, :1])
-                    k_ = self.layout_k(context_norm)
-                    v_ = self.layout_v(context_norm)
+                layout_mod_out, _ = self.layout_mod(vec[i : i + 1])
+                context_normed_raw = self.layout_norm(context)
+                context_norm = (1 + layout_mod_out.scale) * context_normed_raw + layout_mod_out.shift
 
-                    scale = q.shape[-1] ** -0.5
-                    attn_w = torch.softmax((q @ k_.transpose(-2, -1)) * scale, dim=-1)
-                    attn_out = (attn_w @ v_).squeeze(0)
+                H = self.num_layout_heads
+                L = context_norm.shape[1]
+                d = context_norm.shape[2]
+                q_h = self.layout_q(context_norm).reshape(1, L, H, d // H).transpose(1, 2)
+                k_h = self.layout_k(context_norm).reshape(1, L, H, d // H).transpose(1, 2)
+                v_h = self.layout_v(context_norm).reshape(1, L, H, d // H).transpose(1, 2)
+                scale_factor = (d // H) ** -0.5
+                attn_out = (torch.softmax((q_h @ k_h.transpose(-2, -1)) * scale_factor, dim=-1) @ v_h)
+                attn_out = attn_out.transpose(1, 2).reshape(1, L, d)
 
-                    delta = layout_scale * self.layout_out(attn_out)
-                    delta_2d = delta.reshape(1, -1).expand(img_idxs.shape[0], -1)
-                    hidden_states_add[i].scatter_add_(
-                        0,
-                        img_idxs.unsqueeze(-1).expand(-1, hs),
-                        delta_2d,
-                    )
-                    layout_hidden_add[i, j] = delta.reshape(-1)
+                obj_out = attn_out[:, :1]
+                region_out = attn_out[:, 1:]
 
-            x = torch.cat([x[:, :txt_len], img + hidden_states_add], dim=1)
+                delta_region = (
+                    layout_mod_out.gate * layout_scale * self.layout_out(region_out.squeeze(0))
+                ).squeeze(0)
+                hidden_states_add[i].scatter_add_(
+                    0,
+                    img_idxs.unsqueeze(-1).expand(-1, hs),
+                    delta_region,
+                )
+                density_map[i].scatter_add_(
+                    0,
+                    img_idxs.unsqueeze(-1),
+                    torch.ones(img_idxs.shape[0], 1, device=img.device, dtype=img.dtype),
+                )
+                layout_hidden_add[i, j] = (
+                    layout_mod_out.gate * layout_scale * self.layout_out(obj_out.squeeze(0))
+                ).squeeze(0).squeeze(0)
+
+            density_map = density_map.clamp(min=1.0)
+            img = img + hidden_states_add / density_map
+            x = torch.cat([x[:, :txt_len], img], dim=1)
             layout_hidden_states = layout_hidden_states + layout_hidden_add
             return x, layout_hidden_states
         return x, None

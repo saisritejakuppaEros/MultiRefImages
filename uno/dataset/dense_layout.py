@@ -25,6 +25,21 @@ def crop_bbox_from_image(img: Image.Image, bbox: list, hw: tuple[int, int]) -> I
     return img.crop((x1_px, y1_px, x2_px, y2_px))
 
 
+def resize_and_pad_ref(img: Image.Image, target_size: int = 320) -> Image.Image:
+    """
+    Resize so the long edge = target_size, then pad the short edge.
+    Preserves aspect ratio far better than square-padding from scratch.
+    """
+    w, h = img.size
+    if w == 0 or h == 0:
+        return Image.new("RGB", (target_size, target_size), (0, 0, 0))
+    scale = target_size / max(w, h)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    return pad_to_size(img, target_size, target_size)
+
+
 def pad_to_size(img: Image.Image, target_h: int, target_w: int) -> Image.Image:
     """Pad PIL image to target size. Center pad, no resize."""
     w, h = img.size
@@ -79,16 +94,17 @@ class DenseLayoutDataset(Dataset):
     """
 
     REF_SIZE = 320
-    MAX_VAE_REFS = 5
 
     def __init__(
         self,
         split: str = "train",
         cache_dir: str | None = "./data",
         max_clip_objs: int = 50,
+        max_vae_refs: int = 5,
     ):
         self.split = split
         self.max_clip_objs = max_clip_objs
+        self.max_vae_refs = max_vae_refs
         self.ds = load_dataset("FireRedTeam/DenseLayout", split=split, cache_dir=cache_dir)
         self.transform = Compose([
             ToTensor(),
@@ -139,15 +155,15 @@ class DenseLayoutDataset(Dataset):
         ]
         with_area.sort(key=lambda x: x[1], reverse=True)
 
-        vae_annos = [a for a, _ in with_area[: self.MAX_VAE_REFS]]
-        clip_annos = [a for a, _ in with_area[self.MAX_VAE_REFS : self.MAX_VAE_REFS + self.max_clip_objs]]
+        vae_annos = [a for a, _ in with_area[: self.max_vae_refs]]
+        clip_annos = [a for a, _ in with_area[self.max_vae_refs : self.max_vae_refs + self.max_clip_objs]]
 
         vae_ref_pils = []
         vae_bboxes = []
         for a in vae_annos:
             bbox_norm = self._bbox_to_normalized_xyxy(a, hw)
             crop = crop_bbox_from_image(image, bbox_norm, hw)
-            crop = pad_to_size(crop, self.REF_SIZE, self.REF_SIZE)
+            crop = resize_and_pad_ref(crop, self.REF_SIZE)
             vae_ref_pils.append(crop)
             vae_bboxes.append(bbox_norm)
 
@@ -155,7 +171,7 @@ class DenseLayoutDataset(Dataset):
         for a in clip_annos:
             bbox_norm = self._bbox_to_normalized_xyxy(a, hw)
             crop = crop_bbox_from_image(image, bbox_norm, hw)
-            crop = pad_to_size(crop, self.REF_SIZE, self.REF_SIZE)
+            crop = resize_and_pad_ref(crop, self.REF_SIZE)
             clip_conds_raw.append({
                 "bbox": bbox_norm,
                 "hw": list(hw),

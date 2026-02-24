@@ -14,7 +14,7 @@ import torch.nn.functional as F
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from diffusers.optimization import get_scheduler
 from einops import rearrange
 from PIL import Image
@@ -39,6 +39,117 @@ from datasets import load_dataset
 from uno.flux.util import load_ae, load_clip, load_flow_model, load_t5, set_lora
 
 logger = get_logger(__name__)
+
+LAYOUT_KEYS = {
+    "layout_net", "layout_q", "layout_k", "layout_v",
+    "layout_out", "layout_norm", "layout_mod",
+}
+
+
+def setup_phase(args, dit, logger):
+    active_double = set(args.layout_double_blocks) if args.layout_double_blocks else set(range(19))
+    active_single = set(args.layout_single_blocks) if args.layout_single_blocks else set(range(38))
+
+    for p in dit.parameters():
+        p.requires_grad_(False)
+
+    if args.training_phase == 1:
+        for i, block in enumerate(dit.double_blocks):
+            if i in active_double:
+                for n, p in block.named_parameters():
+                    if any(k in n for k in LAYOUT_KEYS):
+                        p.requires_grad_(True)
+        for i, block in enumerate(dit.single_blocks):
+            if i in active_single:
+                for n, p in block.named_parameters():
+                    if any(k in n for k in LAYOUT_KEYS):
+                        p.requires_grad_(True)
+        for p in dit.layout_net.parameters():
+            p.requires_grad_(True)
+        optimizer = torch.optim.AdamW(
+            [p for p in dit.parameters() if p.requires_grad],
+            lr=args.learning_rate,
+            betas=tuple(args.adam_betas),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_eps,
+        )
+        logger.info(
+            f"Phase 1: {sum(p.numel() for p in dit.parameters() if p.requires_grad) / 1e6:.0f}M layout params training"
+        )
+
+    elif args.training_phase == 2:
+        if args.phase1_ckpt and os.path.exists(args.phase1_ckpt):
+            dit.load_state_dict(load_file(args.phase1_ckpt), strict=False)
+            logger.info(f"Phase 2: loaded Phase 1 weights from {args.phase1_ckpt}")
+        for n, p in dit.named_parameters():
+            if "lora" in n.lower() or "processor" in n.lower():
+                p.requires_grad_(True)
+        optimizer = torch.optim.AdamW(
+            [p for p in dit.parameters() if p.requires_grad],
+            lr=args.learning_rate,
+            betas=tuple(args.adam_betas),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_eps,
+        )
+        logger.info(
+            f"Phase 2: {sum(p.numel() for p in dit.parameters() if p.requires_grad) / 1e6:.0f}M LoRA params training"
+        )
+
+    elif args.training_phase == 3:
+        if args.phase1_ckpt and os.path.exists(args.phase1_ckpt):
+            dit.load_state_dict(load_file(args.phase1_ckpt), strict=False)
+            logger.info(f"Phase 3: loaded Phase 1 layout from {args.phase1_ckpt}")
+        if args.phase2_ckpt and os.path.exists(args.phase2_ckpt):
+            dit.load_state_dict(load_file(args.phase2_ckpt), strict=False)
+            logger.info(f"Phase 3: loaded Phase 2 LoRA from {args.phase2_ckpt}")
+        for i, block in enumerate(dit.double_blocks):
+            if i in active_double:
+                for n, p in block.named_parameters():
+                    if any(k in n for k in LAYOUT_KEYS):
+                        p.requires_grad_(True)
+        for i, block in enumerate(dit.single_blocks):
+            if i in active_single:
+                for n, p in block.named_parameters():
+                    if any(k in n for k in LAYOUT_KEYS):
+                        p.requires_grad_(True)
+        for p in dit.layout_net.parameters():
+            p.requires_grad_(True)
+        for n, p in dit.named_parameters():
+            if "lora" in n.lower() or "processor" in n.lower():
+                p.requires_grad_(True)
+
+        layout_param_ids = set()
+        for i, block in enumerate(list(dit.double_blocks) + list(dit.single_blocks)):
+            block_idx = i if i < 19 else i - 19
+            block_list = dit.double_blocks if i < 19 else dit.single_blocks
+            target_set = active_double if i < 19 else active_single
+            if block_idx in target_set:
+                for n, p in block.named_parameters():
+                    if any(k in n for k in LAYOUT_KEYS):
+                        layout_param_ids.add(id(p))
+        for p in dit.layout_net.parameters():
+            layout_param_ids.add(id(p))
+
+        layout_params = [p for p in dit.parameters() if p.requires_grad and id(p) in layout_param_ids]
+        lora_params = [p for p in dit.parameters() if p.requires_grad and id(p) not in layout_param_ids]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": lora_params, "lr": args.learning_rate},
+                {"params": layout_params, "lr": args.learning_rate * args.layout_lr_multiplier},
+            ],
+            betas=tuple(args.adam_betas),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_eps,
+        )
+        logger.info(
+            f"Phase 3: {sum(p.numel() for p in lora_params) / 1e6:.0f}M LoRA @ {args.learning_rate:.1e}, "
+            f"{sum(p.numel() for p in layout_params) / 1e6:.0f}M layout @ {args.learning_rate * args.layout_lr_multiplier:.1e}"
+        )
+
+    else:
+        raise ValueError(f"Invalid training_phase: {args.training_phase}")
+
+    return optimizer
 
 
 def get_models(name: str, device: torch.device, offload: bool = False, cache_dir: str | None = None):
@@ -116,10 +227,16 @@ class TrainArgs:
     max_clip_objs: int = 50
     text_dropout: float = 0.1
 
-    layout_scale: float = 1.0
-    grounding_ratio: float = 0.4
+    layout_scale: float = 1.5
+    grounding_ratio: float = 0.3
+    layout_warmup_steps: int = 2000
     layout_double_blocks: list[int] | None = None
     layout_single_blocks: list[int] | None = None
+
+    training_phase: int = 3
+    phase1_ckpt: str | None = None
+    phase2_ckpt: str | None = None
+    layout_lr_multiplier: float = 2.0
 
     log_dir: str = "log/hybrid"
     log_image_freq: int = 500
@@ -132,6 +249,7 @@ def main(args: TrainArgs):
         project_dir=args.project_dir,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
+        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
     set_seed(args.seed, device_specific=True)
 
@@ -163,41 +281,19 @@ def main(args: TrainArgs):
         args.single_blocks_indices,
         accelerator.device,
     )
-    dit.enable_layout(args.layout_double_blocks, args.layout_single_blocks)
+    layout_double = args.layout_double_blocks if args.layout_double_blocks is not None else [0, 2, 4, 6, 8, 10, 12]
+    layout_single = args.layout_single_blocks if args.layout_single_blocks is not None else [0]
+    dit.enable_layout(layout_double, layout_single)
     dit.train()
     dit.gradient_checkpointing = args.gradient_checkpoint
 
-    layout_params = [
-        p
-        for n, p in dit.named_parameters()
-        if p.requires_grad
-        and any(
-            k in n
-            for k in (
-                "layout_net",
-                "layout_q",
-                "layout_k",
-                "layout_v",
-                "layout_out",
-                "layout_norm",
-            )
-        )
-    ]
-    base_params = [
-        p
-        for n, p in dit.named_parameters()
-        if p.requires_grad and p not in layout_params
-    ]
-    param_groups = [{"params": base_params, "lr": args.learning_rate}]
-    if layout_params:
-        param_groups.append({"params": layout_params, "lr": args.learning_rate * 2.0})
+    optimizer = setup_phase(args, dit, logger)
 
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        betas=args.adam_betas,
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_eps,
-    )
+    if weight_dtype == torch.float32:
+        dit = dit.float()
+    elif weight_dtype == torch.float16:
+        dit = dit.half()
+
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -224,6 +320,7 @@ def main(args: TrainArgs):
         split=args.train_split,
         cache_dir=args.cache_dir,
         max_clip_objs=args.max_clip_objs,
+        max_vae_refs=args.max_vae_refs,
     )
 
     collate = partial(dense_layout_collate, clip_embedder=clip_img)
@@ -324,7 +421,23 @@ def main(args: TrainArgs):
             x_t = (1 - t_val[:, None, None]) * x_1 + t_val[:, None, None] * x_0
 
         with accelerator.accumulate(dit):
-            current_step_ratio = random.uniform(0.0, 1.0)
+            if args.training_phase == 1:
+                current_step_ratio = 0.0
+            else:
+                current_step_ratio = random.uniform(0.0, 1.0)
+
+            if args.training_phase == 2:
+                layout_kw = None
+            else:
+                layout_kw = inp.get("layout_kwargs")
+
+            if args.training_phase == 3 and global_step < args.layout_warmup_steps:
+                effective_layout_scale = args.layout_scale * (
+                    global_step / max(args.layout_warmup_steps, 1)
+                )
+            else:
+                effective_layout_scale = args.layout_scale
+
             ref_img = inp.get("ref_img")
             ref_img_ids = inp.get("ref_img_ids")
 
@@ -338,8 +451,8 @@ def main(args: TrainArgs):
                 y=inp["vec"].to(weight_dtype),
                 timesteps=t_val.to(weight_dtype),
                 guidance=torch.full((bs,), 1.0, device=accelerator.device, dtype=weight_dtype),
-                layout_kwargs=inp["layout_kwargs"],
-                layout_scale=args.layout_scale,
+                layout_kwargs=layout_kw,
+                layout_scale=effective_layout_scale,
                 grounding_ratio=args.grounding_ratio,
                 current_step_ratio=current_step_ratio,
             )
@@ -350,8 +463,9 @@ def main(args: TrainArgs):
             train_loss_accum += avg_loss / args.gradient_accumulation_steps
 
             accelerator.backward(loss)
+            grad_norm = None
             if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(dit.parameters(), args.max_grad_norm)
+                grad_norm = accelerator.clip_grad_norm_(dit.parameters(), args.max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
@@ -360,7 +474,22 @@ def main(args: TrainArgs):
             progress_bar.update(1)
             global_step += 1
             if tb_writer is not None:
-                tb_writer.add_scalar("train_loss", train_loss_accum, global_step)
+                tb_writer.add_scalar("train/loss", train_loss_accum, global_step)
+                tb_writer.add_scalar(
+                    "train/learning_rate",
+                    lr_scheduler.get_last_lr()[0],
+                    global_step,
+                )
+                if args.training_phase in (1, 3) and layout_kw is not None:
+                    _eff = (
+                        args.layout_scale * (global_step / max(args.layout_warmup_steps, 1))
+                        if args.training_phase == 3 and global_step < args.layout_warmup_steps
+                        else args.layout_scale
+                    )
+                    tb_writer.add_scalar("train/layout_scale", _eff, global_step)
+                if grad_norm is not None:
+                    tb_writer.add_scalar("train/grad_norm", grad_norm, global_step)
+                tb_writer.add_scalar("train/phase", args.training_phase, global_step)
             train_loss_accum = 0.0
 
         if accelerator.sync_gradients and global_step % args.checkpointing_steps == 0:
@@ -368,11 +497,20 @@ def main(args: TrainArgs):
             os.makedirs(save_path, exist_ok=True)
             unwrapped = accelerator.unwrap_model(dit)
             state = unwrapped.state_dict()
-            layout_keys = [k for k in state if any(x in k for x in ("layout_net", "layout_q", "layout_k", "layout_v", "layout_out", "layout_norm"))]
-            lora_keys = [k for k in state if "lora" in k or "processor" in k]
-            to_save = {k: state[k] for k in layout_keys + lora_keys if k in state}
+            layout_keys = [
+                k
+                for k in state
+                if any(x in k for x in ("layout_net", "layout_q", "layout_k", "layout_v", "layout_out", "layout_norm", "layout_mod"))
+            ]
+            lora_keys = [k for k in state if "lora" in k.lower() or "processor" in k.lower()]
+            if args.training_phase == 1:
+                to_save = {k: state[k] for k in layout_keys if k in state}
+            elif args.training_phase == 2:
+                to_save = {k: state[k] for k in lora_keys if k in state}
+            else:
+                to_save = {k: state[k] for k in layout_keys + lora_keys if k in state}
             to_save["global_step"] = torch.tensor(global_step)
-            save_file(to_save, os.path.join(save_path, "hybrid_lora_layout.safetensors"), safe_serialization=True)
+            save_file(to_save, os.path.join(save_path, "hybrid_lora_layout.safetensors"))
             logger.info(f"Saved checkpoint to {save_path}")
 
         if accelerator.sync_gradients and tb_writer is not None and global_step % args.log_image_freq == 0 and global_step > 0:
@@ -392,9 +530,15 @@ def main(args: TrainArgs):
                     latent_hw=latent_hw_full,
                     pe=args.pe, device=accelerator.device, dtype=torch.bfloat16,
                 )
+                _layout_kw = None if args.training_phase == 2 else inp_cond["layout_kwargs"]
+                _layout_scale = (
+                    args.layout_scale * (global_step / max(args.layout_warmup_steps, 1))
+                    if args.training_phase == 3 and global_step < args.layout_warmup_steps
+                    else args.layout_scale
+                )
                 out = denoise_hybrid(
-                    dit, layout_kwargs=inp_cond["layout_kwargs"],
-                    layout_scale=args.layout_scale, grounding_ratio=args.grounding_ratio,
+                    dit, layout_kwargs=_layout_kw,
+                    layout_scale=_layout_scale, grounding_ratio=args.grounding_ratio,
                     **{k: v for k, v in inp_cond.items() if k != "layout_kwargs"},
                     timesteps=timesteps, guidance=4.0,
                 )
@@ -440,6 +584,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--log_dir", type=str, default=None)
     arg_parser.add_argument("--checkpointing_steps", type=int, default=None)
     arg_parser.add_argument("--log_image_freq", type=int, default=None)
+    arg_parser.add_argument("--mixed_precision", type=str, default=None)
     parsed, remaining = arg_parser.parse_known_args()
 
     if parsed.config and os.path.exists(parsed.config):
@@ -459,5 +604,7 @@ if __name__ == "__main__":
         args.checkpointing_steps = parsed.checkpointing_steps
     if parsed.log_image_freq is not None:
         args.log_image_freq = parsed.log_image_freq
+    if parsed.mixed_precision is not None:
+        args.mixed_precision = parsed.mixed_precision
 
     main(args)
