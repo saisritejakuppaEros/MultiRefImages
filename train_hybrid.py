@@ -423,13 +423,24 @@ def main(args: TrainArgs):
         with accelerator.accumulate(dit):
             if args.training_phase == 1:
                 current_step_ratio = 0.0
+                ref_img = None
+                ref_img_ids = None
             else:
                 current_step_ratio = random.uniform(0.0, 1.0)
+                ref_img = inp.get("ref_img")
+                ref_img_ids = inp.get("ref_img_ids")
 
             if args.training_phase == 2:
                 layout_kw = None
-            else:
+            elif args.training_phase == 1:
                 layout_kw = inp.get("layout_kwargs")
+            else:
+                # Layout dropout: randomly disable layout 10% of time for generalization
+                # Only in Phase 3 - Phase 1 must always use layout since only layout params are trainable
+                if random.random() < 0.1:
+                    layout_kw = None
+                else:
+                    layout_kw = inp.get("layout_kwargs")
 
             if args.training_phase == 3 and global_step < args.layout_warmup_steps:
                 effective_layout_scale = args.layout_scale * (
@@ -437,9 +448,6 @@ def main(args: TrainArgs):
                 )
             else:
                 effective_layout_scale = args.layout_scale
-
-            ref_img = inp.get("ref_img")
-            ref_img_ids = inp.get("ref_img_ids")
 
             model_pred = dit(
                 img=x_t.to(weight_dtype),
@@ -459,6 +467,37 @@ def main(args: TrainArgs):
 
             target = (x_0 - x_1).float()
             loss = F.mse_loss(model_pred.float(), target, reduction="mean")
+            
+            # Compute bbox-masked loss for Phase 1
+            bbox_loss_value = 0.0  # For logging only
+            if args.training_phase == 1 and layout_kw is not None:
+                layout_data = layout_kw.get("layout")
+                if layout_data is not None:
+                    img_idxs_list = layout_data["img_idxs_list"]
+                    masks = layout_data["masks"][0]  # batch_size=1
+                    valid_objs = (masks == 1).nonzero(as_tuple=False).squeeze(-1)
+                    
+                    if len(valid_objs) > 0:
+                        bbox_losses = []
+                        for obj_idx in valid_objs:
+                            obj_idx_val = obj_idx.item()
+                            if obj_idx_val < len(img_idxs_list):
+                                img_idxs = img_idxs_list[obj_idx_val]
+                                if img_idxs.numel() > 0:
+                                    bbox_losses.append(F.mse_loss(
+                                        model_pred[:, img_idxs], 
+                                        target[:, img_idxs]
+                                    ))
+                        
+                        if bbox_losses:
+                            bbox_loss = torch.stack(bbox_losses).mean()
+                            bbox_loss_value = bbox_loss.item()
+                            # Curriculum: Start with strong bbox loss, gradually reduce
+                            # Early training: focus on spatial layout
+                            # Late training: focus on global coherence
+                            bbox_weight = 0.5 * max(0.3, 1.0 - global_step / args.max_train_steps)
+                            loss = loss + bbox_weight * bbox_loss
+            
             avg_loss = accelerator.gather(loss.detach()).mean().item()
             train_loss_accum += avg_loss / args.gradient_accumulation_steps
 
@@ -480,6 +519,9 @@ def main(args: TrainArgs):
                     lr_scheduler.get_last_lr()[0],
                     global_step,
                 )
+                # Log bbox loss separately for Phase 1
+                if args.training_phase == 1 and layout_kw is not None and bbox_loss_value > 0:
+                    tb_writer.add_scalar("train/bbox_loss", bbox_loss_value, global_step)
                 if args.training_phase in (1, 3) and layout_kw is not None:
                     _eff = (
                         args.layout_scale * (global_step / max(args.layout_warmup_steps, 1))
